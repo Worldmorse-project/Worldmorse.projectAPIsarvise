@@ -1,17 +1,15 @@
-import { q } from "./db.js";
+import { pool } from "./db.js";
 
 export async function migrate() {
-  await q(`
+  await pool.query(`
     create table if not exists stations (
       callsign text primary key,
       channel text not null,
-      mode text default 'morse',
-      frequency double precision,
       last_seen timestamptz not null default now()
     );
   `);
 
-  await q(`
+  await pool.query(`
     create table if not exists messages (
       id bigserial primary key,
       channel text not null,
@@ -23,7 +21,7 @@ export async function migrate() {
     );
   `);
 
-  await q(`
+  await pool.query(`
     create table if not exists contacts (
       id bigserial primary key,
       my_callsign text not null,
@@ -31,8 +29,7 @@ export async function migrate() {
       name text,
       location text,
       notes text,
-      last_contact_date timestamptz,
-      qso_count int default 0,
+      updated_at timestamptz not null default now(),
       unique(my_callsign, callsign)
     );
   `);
