@@ -3,65 +3,77 @@ import express from "express";
 import cors from "cors";
 import { WebSocketServer } from "ws";
 import { pool } from "./db.js";
+import { migrate } from "./migrate.js";
 
 const PORT = process.env.PORT || 3000;
+const DEFAULT_CHANNEL = process.env.DEFAULT_CHANNEL || "7.050";
+const STATION_TTL_SEC = Number(process.env.STATION_TTL_SEC || 120);
+const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
+
 const app = express();
 
-app.use(cors({
-  origin: "*", // まずは緩め。後でフロントURLに絞る
-}));
+app.use(
+  cors({
+    origin: CORS_ORIGIN === "*" ? true : CORS_ORIGIN,
+  })
+);
 app.use(express.json());
 
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
 const norm = (s) => String(s || "").trim().toUpperCase();
 
-// --- REST: stations/register
+// -------- REST --------
+
+// stations/register
 app.post("/v1/stations/register", async (req, res) => {
   try {
     const callsign = norm(req.body?.callsign);
+    const channel = String(req.body?.channel || DEFAULT_CHANNEL);
+
     if (!callsign) return res.status(400).json({ ok: false, error: "callsign_required" });
 
-    // channelはフロント側で持ってるので、ここではDBに最終接続を残すだけでもOK
     await pool.query(
       `insert into stations(callsign, channel, last_seen)
        values($1, $2, now())
-       on conflict (callsign) do update set last_seen=now()`,
-      [callsign, ""] // channelはWS接続時に更新する想定
+       on conflict (callsign)
+       do update set channel=excluded.channel, last_seen=now()`,
+      [callsign, channel]
     );
 
-    res.json({ ok: true, station: { callsign } });
-  } catch (e) {
+    res.json({ ok: true, station: { callsign, channel } });
+  } catch {
     res.status(500).json({ ok: false, error: "register_failed" });
   }
 });
 
-// --- REST: stations/online
+// stations/online
 app.get("/v1/stations/online", async (req, res) => {
   try {
-    const channel = String(req.query?.channel || "");
-    // 直近2分をオンライン扱い（適当に調整）
+    const channel = String(req.query?.channel || DEFAULT_CHANNEL);
+
     const { rows } = await pool.query(
       `select callsign, channel, last_seen
        from stations
-       where ($1 = '' or channel = $1)
-         and last_seen > now() - interval '2 minutes'
+       where channel = $1
+         and last_seen > now() - ($2 || ' seconds')::interval
        order by last_seen desc
        limit 200`,
-      [channel]
+      [channel, STATION_TTL_SEC]
     );
+
     res.json({ ok: true, stations: rows });
-  } catch (e) {
+  } catch {
     res.status(500).json({ ok: false, error: "online_failed" });
   }
 });
 
-// --- REST: messages (send)
+// messages/send
 app.post("/v1/messages", async (req, res) => {
   try {
     const fromCallsign = norm(req.body?.fromCallsign);
     const toCallsign = req.body?.toCallsign ? norm(req.body?.toCallsign) : null;
-    const channel = String(req.body?.channel || "");
+    const channel = String(req.body?.channel || DEFAULT_CHANNEL);
     const type = String(req.body?.type || "CW_MORSE");
     const payload = req.body?.payload || {};
 
@@ -76,7 +88,16 @@ app.post("/v1/messages", async (req, res) => {
       [channel, fromCallsign, toCallsign, type, payload]
     );
 
-    // WSへブロードキャスト
+    // REST送信でもオンライン維持できるよう station を更新
+    await pool.query(
+      `insert into stations(callsign, channel, last_seen)
+       values($1,$2, now())
+       on conflict(callsign)
+       do update set channel=excluded.channel, last_seen=now()`,
+      [fromCallsign, channel]
+    );
+
+    // WS broadcast
     broadcastToChannel(channel, {
       kind: "message",
       message: {
@@ -86,20 +107,20 @@ app.post("/v1/messages", async (req, res) => {
         toCallsign,
         type,
         payload,
-        created_at: rows[0].created_at
-      }
+        created_at: rows[0].created_at,
+      },
     });
 
     res.json({ ok: true });
-  } catch (e) {
+  } catch {
     res.status(500).json({ ok: false, error: "send_failed" });
   }
 });
 
-// --- REST: messages/recent
+// messages/recent
 app.get("/v1/messages/recent", async (req, res) => {
   try {
-    const channel = String(req.query?.channel || "");
+    const channel = String(req.query?.channel || DEFAULT_CHANNEL);
     const limit = Math.min(500, Math.max(1, Number(req.query?.limit || 100)));
 
     const { rows } = await pool.query(
@@ -112,12 +133,12 @@ app.get("/v1/messages/recent", async (req, res) => {
     );
 
     res.json({ ok: true, messages: rows.reverse() });
-  } catch (e) {
+  } catch {
     res.status(500).json({ ok: false, error: "recent_failed" });
   }
 });
 
-// --- REST: contacts/list
+// contacts/list
 app.get("/v1/contacts/list", async (req, res) => {
   try {
     const myCallsign = norm(req.query?.myCallsign);
@@ -132,12 +153,12 @@ app.get("/v1/contacts/list", async (req, res) => {
       [myCallsign]
     );
     res.json({ ok: true, contacts: rows });
-  } catch (e) {
+  } catch {
     res.status(500).json({ ok: false, error: "contacts_failed" });
   }
 });
 
-// --- REST: contacts/update
+// contacts/update
 app.patch("/v1/contacts/update", async (req, res) => {
   try {
     const myCallsign = norm(req.body?.myCallsign);
@@ -154,16 +175,19 @@ app.patch("/v1/contacts/update", async (req, res) => {
     );
 
     res.json({ ok: true });
-  } catch (e) {
+  } catch {
     res.status(500).json({ ok: false, error: "contact_update_failed" });
   }
 });
 
-const server = app.listen(PORT, () => {
+// -------- WebSocket --------
+
+const server = app.listen(PORT, async () => {
+  // 起動時にDBを最低限整える
+  await migrate();
   console.log(`WorldMorse API listening on :${PORT}`);
 });
 
-// -------- WebSocket --------
 const wss = new WebSocketServer({ noServer: true });
 const channelClients = new Map(); // channel -> Set(ws)
 
@@ -174,6 +198,11 @@ function broadcastToChannel(channel, obj) {
   for (const ws of set) {
     if (ws.readyState === 1) ws.send(data);
   }
+}
+
+function cleanupChannelIfEmpty(channel) {
+  const set = channelClients.get(channel);
+  if (set && set.size === 0) channelClients.delete(channel);
 }
 
 server.on("upgrade", (req, socket, head) => {
@@ -187,7 +216,8 @@ wss.on("connection", async (ws, req) => {
   try {
     const url = new URL(req.url, "http://localhost");
     const callsign = norm(url.searchParams.get("callsign"));
-    const channel = String(url.searchParams.get("channel") || "");
+    const channel = String(url.searchParams.get("channel") || DEFAULT_CHANNEL);
+
     if (!callsign || !channel) {
       ws.close();
       return;
@@ -196,10 +226,12 @@ wss.on("connection", async (ws, req) => {
     // join
     if (!channelClients.has(channel)) channelClients.set(channel, new Set());
     channelClients.get(channel).add(ws);
+
     ws._channel = channel;
     ws._callsign = callsign;
+    ws.isAlive = true;
 
-    // station heartbeat更新
+    // 初回 last_seen
     await pool.query(
       `insert into stations(callsign, channel, last_seen)
        values($1,$2, now())
@@ -209,19 +241,35 @@ wss.on("connection", async (ws, req) => {
 
     ws.send(JSON.stringify({ kind: "hello", ok: true, callsign, channel }));
 
-    const iv = setInterval(async () => {
+    // サーバー側の死活監視（Render/proxy対策）
+    ws.on("pong", () => {
+      ws.isAlive = true;
+    });
+
+    const heartbeat = setInterval(async () => {
       try {
-        await pool.query(`update stations set last_seen=now(), channel=$2 where callsign=$1`, [callsign, channel]);
-      } catch {}
+        // ping
+        ws.isAlive = false;
+        ws.ping();
+
+        // last_seen 更新
+        await pool.query(
+          `update stations set last_seen=now(), channel=$2 where callsign=$1`,
+          [callsign, channel]
+        );
+      } catch {
+        // 失敗したら放置（closeで掃除する）
+      }
     }, 30_000);
 
     ws.on("close", () => {
-      clearInterval(iv);
+      clearInterval(heartbeat);
       channelClients.get(channel)?.delete(ws);
+      cleanupChannelIfEmpty(channel);
     });
 
     ws.on("message", () => {
-      // 将来：クライアント→サーバーWS送信を使いたくなったらここで処理
+      // 将来：WebRTCシグナリング等を入れたいならここで channel broadcast する
     });
   } catch {
     ws.close();
