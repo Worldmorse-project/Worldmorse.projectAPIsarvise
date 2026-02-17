@@ -1,9 +1,9 @@
 import pg from "pg";
-
 const { Pool } = pg;
 
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  // Render Postgres はSSLが必要になることが多い
-  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
+  ssl: {
+    rejectUnauthorized: false
+  }
 });
