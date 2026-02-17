@@ -2,10 +2,10 @@
   "name": "worldmorse-api",
   "version": "1.0.0",
   "type": "module",
-  "main": "server.js",
+  "main": "src/server.js",
   "scripts": {
     "dev": "node server.js",
-    "start": "node server.js"
+    "start": "node src/server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
